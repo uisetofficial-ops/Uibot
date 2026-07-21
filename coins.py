@@ -3,20 +3,24 @@ from discord.ext import commands, tasks
 from discord import app_commands
 import aiohttp
 import feedparser
-import os
 import re
 import database
 
-YOUTUBE_HANDLE = os.environ.get("YOUTUBE_CHANNEL_HANDLE", "@Uiset")
 RSS_BASE = "https://www.youtube.com/feeds/videos.xml?channel_id={}"
 POLL_INTERVAL = 5  # minutes
 
 
-async def resolve_channel_id(handle: str) -> str | None:
-    """Resolve a YouTube @handle to a channel ID by fetching the channel page."""
-    handle = handle.lstrip("@")
+async def resolve_channel_id(handle_or_id: str) -> str | None:
+    """Resolve a YouTube @handle or channel ID to a channel ID."""
+    # If user already gave a channel ID (starts with UC...)
+    if handle_or_id.startswith("UC") and len(handle_or_id) >= 10:
+        return handle_or_id
+
+    # Otherwise treat it as a handle
+    handle = handle_or_id.lstrip("@")
     url = f"https://www.youtube.com/@{handle}"
     headers = {"User-Agent": "Mozilla/5.0 (compatible; bot)"}
+
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -26,13 +30,13 @@ async def resolve_channel_id(handle: str) -> str | None:
                     return match.group(1)
     except Exception as e:
         print(f"[YT] Failed to resolve handle {handle}: {e}")
+
     return None
 
 
 class YouTubeAlerts(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.channel_id: str | None = None
         self.check_youtube.start()
 
     def cog_unload(self):
@@ -40,55 +44,55 @@ class YouTubeAlerts(commands.Cog):
 
     @tasks.loop(minutes=POLL_INTERVAL)
     async def check_youtube(self):
-        if not self.channel_id:
-            self.channel_id = await resolve_channel_id(YOUTUBE_HANDLE)
-            if not self.channel_id:
-                print("[YT] Could not resolve YouTube channel ID. Retrying next cycle.")
-                return
-
-        rss_url = RSS_BASE.format(self.channel_id)
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(rss_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    content = await resp.text()
-            feed = feedparser.parse(content)
-        except Exception as e:
-            print(f"[YT] RSS fetch error: {e}")
-            return
-
-        if not feed.entries:
-            return
-
-        latest = feed.entries[0]
-        latest_id = latest.get("yt_videoid", "")
-        latest_url = latest.get("link", "")
-        latest_title = latest.get("title", "New Video")
-        channel_name = feed.feed.get("title", "The channel")
+        await self.bot.wait_until_ready()
 
         for guild in self.bot.guilds:
-            db_channel_id = await database.get_setting(guild.id, "yt_alert_channel")
-            last_video_id = await database.get_setting(guild.id, "yt_last_video_id")
+            channel_id = await database.get_setting(guild.id, "yt_channel_id")
+            alert_channel_id = await database.get_setting(guild.id, "yt_alert_channel")
 
-            if not db_channel_id:
+            if not channel_id or not alert_channel_id:
                 continue
+
+            rss_url = RSS_BASE.format(channel_id)
+
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(rss_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        content = await resp.text()
+                feed = feedparser.parse(content)
+            except Exception as e:
+                print(f"[YT] RSS fetch error: {e}")
+                continue
+
+            if not feed.entries:
+                continue
+
+            latest = feed.entries[0]
+            latest_id = latest.get("yt_videoid", "")
+            latest_url = latest.get("link", "")
+            latest_title = latest.get("title", "New Video")
+            channel_name = feed.feed.get("title", "The channel")
+
+            last_video_id = await database.get_setting(guild.id, "yt_last_video_id")
             if last_video_id == latest_id:
                 continue
 
             await database.set_setting(guild.id, "yt_last_video_id", latest_id)
 
-            alert_channel = guild.get_channel(int(db_channel_id))
+            alert_channel = guild.get_channel(int(alert_channel_id))
             if not alert_channel:
                 continue
 
             embed = discord.Embed(
                 title=f"🎬 {latest_title}",
                 url=latest_url,
-                description=f"Hey **{guild.name}**! **{channel_name}** has uploaded a new video — watch it here! 👇",
+                description=f"Hey **{guild.name}**! **{channel_name}** just uploaded a new video 👇",
                 color=discord.Color.red()
             )
-            embed.set_footer(text="YouTube Upload Alert • Subscribe so you never miss one!")
+            embed.set_footer(text="YouTube Upload Alert")
+
             await alert_channel.send(
-                content=f"@everyone 🔔 **New video just dropped!**",
+                content="@everyone 🔔 **New video just dropped!**",
                 embed=embed
             )
 
@@ -96,31 +100,75 @@ class YouTubeAlerts(commands.Cog):
     async def before_check(self):
         await self.bot.wait_until_ready()
 
+    # ---------------------------------------------------------
+    # ⭐ NEW: /youtube-add <channel link>
+    # ---------------------------------------------------------
+    @app_commands.command(
+        name="youtube-add",
+        description="Add a YouTube channel to track uploads from."
+    )
+    @app_commands.describe(link="Paste the YouTube channel link (@handle or /channel/ID)")
+    async def youtube_add(self, interaction: discord.Interaction, link: str):
+
+        # Extract handle or channel ID
+        handle_or_id = self.extract_handle_or_id(link)
+        if not handle_or_id:
+            await interaction.response.send_message(
+                "❌ Invalid YouTube link. Use:\n"
+                "`https://youtube.com/@YourChannel`\n"
+                "`https://youtube.com/channel/UCxxxxxx`",
+                ephemeral=True
+            )
+            return
+
+        # Resolve to channel ID
+        channel_id = await resolve_channel_id(handle_or_id)
+        if not channel_id:
+            await interaction.response.send_message(
+                "❌ Could not resolve that YouTube channel.",
+                ephemeral=True
+            )
+            return
+
+        await database.set_setting(interaction.guild.id, "yt_channel_id", channel_id)
+        await database.set_setting(interaction.guild.id, "yt_last_video_id", "")
+
+        await interaction.response.send_message(
+            f"✅ Now tracking uploads from **{handle_or_id}** (Channel ID: `{channel_id}`)",
+            ephemeral=True
+        )
+
+    def extract_handle_or_id(self, link: str):
+        # @handle format
+        match = re.search(r"youtube\.com/@([A-Za-z0-9_\-\.]+)", link)
+        if match:
+            return match.group(1)
+
+        # /channel/ID format
+        match = re.search(r"youtube\.com/channel/([A-Za-z0-9_\-]+)", link)
+        if match:
+            return match.group(1)
+
+        return None
+
+    # ---------------------------------------------------------
+    # Existing setup command (kept)
+    # ---------------------------------------------------------
     @app_commands.command(name="setup-yt-alerts", description="Set the channel to receive YouTube upload alerts")
     @app_commands.describe(channel="Channel where upload alerts will be posted")
     @app_commands.checks.has_permissions(manage_guild=True)
     async def setup_yt_alerts(self, interaction: discord.Interaction, channel: discord.TextChannel):
         await database.set_setting(interaction.guild.id, "yt_alert_channel", str(channel.id))
-        await database.set_setting(interaction.guild.id, "yt_last_video_id", "")  # reset to allow first alert
-
-        embed = discord.Embed(
-            title="✅ YouTube Alerts Configured",
-            description=f"Upload alerts for **{YOUTUBE_HANDLE}** will be posted in {channel.mention}.",
-            color=discord.Color.green()
+        await interaction.response.send_message(
+            f"✅ YouTube alerts will be posted in {channel.mention}.",
+            ephemeral=True
         )
-        embed.add_field(name="Check Interval", value=f"Every {POLL_INTERVAL} minutes")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="disable-yt-alerts", description="Disable YouTube upload alerts")
     @app_commands.checks.has_permissions(manage_guild=True)
     async def disable_yt_alerts(self, interaction: discord.Interaction):
         await database.set_setting(interaction.guild.id, "yt_alert_channel", "")
         await interaction.response.send_message("✅ YouTube upload alerts disabled.", ephemeral=True)
-
-    @setup_yt_alerts.error
-    async def setup_error(self, interaction: discord.Interaction, error):
-        if isinstance(error, app_commands.MissingPermissions):
-            await interaction.response.send_message("❌ You need **Manage Server** permission.", ephemeral=True)
 
 
 async def setup(bot: commands.Bot):
